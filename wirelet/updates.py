@@ -10,19 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Optional, Set
 
-from wirelet import errors, raw, utils
-from wirelet.dispatcher import (
-    CALLBACK_QUERY, DELETED_MESSAGES, EDITED_MESSAGE, INLINE_QUERY, MESSAGE, RAW_UPDATE,
-)
+from wirelet import faults, schema, utils
 
 log = logging.getLogger(__name__)
 
 COMMON_BOX = 0
 
 
-class UpdatesMixin:
+class UpdateFeed:
     SAVE_STATE_EVERY = 10
 
     def __init__(self) -> None:
@@ -34,27 +31,40 @@ class UpdatesMixin:
         self._diff_lock = asyncio.Lock()
         self._channel_diffs: Set[int] = set()
         self._state_task: Optional[asyncio.Task] = None
+        # Updates are handled off the network loop, in arrival order: handling
+        # one may need a request whose answer that very loop has to read.
+        self._incoming: Optional[asyncio.Queue] = None
+        self._intake_task: Optional[asyncio.Task] = None
         self._updates_ready = False
 
     # ------------------------------------------------------------------ #
     # Start / stop
     # ------------------------------------------------------------------ #
 
-    async def _start_updates(self) -> None:
+    async def _start_feed(self) -> None:
         saved = await self.storage.get_state(COMMON_BOX)
 
-        if saved and not self.skip_updates:
+        if saved and self.backlog:
             self._pts, self._qts, self._date, self._seq = saved
             self._updates_ready = True
             await self._get_difference()
         else:
-            state = await self.invoke(raw.functions.updates.GetState())
+            state = await self.call(schema.methods.updates.GetState())
             self._pts, self._qts, self._date, self._seq = state.pts, state.qts, state.date, state.seq
             self._updates_ready = True
 
         self._state_task = asyncio.create_task(self._save_state_loop())
+        self._incoming = asyncio.Queue()
+        self._intake_task = asyncio.create_task(self._intake())
 
-    async def _stop_updates(self) -> None:
+    async def _stop_feed(self) -> None:
+        if self._intake_task is not None:
+            self._intake_task.cancel()
+            try:
+                await self._intake_task
+            except asyncio.CancelledError:
+                pass
+            self._intake_task = None
         if self._state_task is not None:
             self._state_task.cancel()
             try:
@@ -87,15 +97,19 @@ class UpdatesMixin:
     # ------------------------------------------------------------------ #
 
     async def _on_raw_updates(self, updates: Any) -> None:
-        if not self._updates_ready or self.no_updates:
-            return
-        try:
-            await self._handle_updates(updates)
-        except Exception:  # noqa: BLE001
-            log.exception("Failed to handle updates")
+        if self._updates_ready and self.listen and self._incoming is not None:
+            self._incoming.put_nowait(updates)
+
+    async def _intake(self) -> None:
+        while True:
+            updates = await self._incoming.get()
+            try:
+                await self._handle_updates(updates)
+            except Exception:  # noqa: BLE001
+                log.exception("Failed to handle updates")
 
     async def _handle_updates(self, updates: Any) -> None:
-        t = raw.types
+        t = schema.objects
 
         if isinstance(updates, t.UpdatesTooLong):
             await self._get_difference()
@@ -133,8 +147,36 @@ class UpdatesMixin:
             await self._accept_pts(updates.pts, updates.pts_count)
             return
 
-    def _short_to_message(self, u) -> "raw.types.Message":
-        t = raw.types
+    async def _absorb(self, result: Any) -> None:
+        """Advance pts from a method's own answer, without delivering anything.
+
+        Sending a message returns Updates numbered in the same sequence as
+        pushed ones; skipping them would make the next push look like a gap.
+        """
+        if not self._updates_ready:
+            return
+        o = schema.objects
+        if isinstance(result, o.UpdateShortSentMessage):
+            await self._accept_pts(result.pts, result.pts_count)
+            return
+        if isinstance(result, o.UpdateShort):
+            updates = [result.update]
+        elif isinstance(result, (o.Updates, o.UpdatesCombined)):
+            updates = result.updates
+        else:
+            return
+        for update in updates:
+            pts, count = getattr(update, "pts", None), getattr(update, "pts_count", None)
+            if pts is None or count is None:
+                continue
+            channel_id = _channel_of(update)
+            if channel_id is not None:
+                await self._accept_channel_pts(channel_id, pts, count)
+            else:
+                await self._accept_pts(pts, count)
+
+    def _short_to_message(self, u) -> "schema.objects.Message":
+        t = schema.objects
         if isinstance(u, t.UpdateShortMessage):
             peer = t.PeerUser(user_id=u.user_id)
             from_id = t.PeerUser(user_id=self.me_id if u.out else u.user_id)
@@ -179,7 +221,7 @@ class UpdatesMixin:
         return False
 
     async def _apply(self, update: Any, users: Dict, chats: Dict) -> None:
-        t = raw.types
+        t = schema.objects
         channel_id = _channel_of(update)
 
         if isinstance(update, t.UpdateChannelTooLong):
@@ -211,13 +253,13 @@ class UpdatesMixin:
         if self._diff_lock.locked() or self._pts is None:
             return
         async with self._diff_lock:
-            t = raw.types
+            t = schema.objects
             while True:
                 try:
-                    diff = await self.invoke(raw.functions.updates.GetDifference(
+                    diff = await self.call(schema.methods.updates.GetDifference(
                         pts=self._pts, date=self._date, qts=self._qts, pts_total_limit=10000,
                     ))
-                except errors.RPCError as e:
+                except faults.TelegramFault as e:
                     log.warning("getDifference failed: %s", e)
                     return
 
@@ -255,19 +297,19 @@ class UpdatesMixin:
             row = await self.storage.get_peer_by_id(utils.CHANNEL_SHIFT - channel_id)
             if row is None:
                 return
-            channel = raw.types.InputChannel(channel_id=channel_id, access_hash=row[1])
-            t = raw.types
+            channel = schema.objects.InputChannel(channel_id=channel_id, access_hash=row[1])
+            t = schema.objects
 
             while True:
                 pts = self._channel_pts.get(channel_id)
                 if pts is None:
                     return
                 try:
-                    diff = await self.invoke(raw.functions.updates.GetChannelDifference(
+                    diff = await self.call(schema.methods.updates.GetChannelDifference(
                         channel=channel, filter=t.ChannelMessagesFilterEmpty(),
                         pts=pts, limit=1000 if self.is_bot else 100, force=True,
                     ))
-                except errors.RPCError as e:
+                except faults.TelegramFault as e:
                     log.debug("getChannelDifference(%s) failed: %s", channel_id, e)
                     return
 
@@ -303,84 +345,63 @@ class UpdatesMixin:
     # ------------------------------------------------------------------ #
 
     async def _emit(self, update: Any, users: Dict, chats: Dict) -> None:
-        from wirelet.types import CallbackQuery, InlineQuery, Message, User
+        from wirelet.model import Deleted, Inline, Press, User
+        from wirelet.model.message import message_from
+        from wirelet.model.people import user_from
 
-        t = raw.types
-        d = self.dispatcher
+        o = schema.objects
+        r = self._router
 
-        if d.has(RAW_UPDATE):
-            d.feed(RAW_UPDATE, update, users, chats)
+        def author(user_id: int) -> User:
+            return user_from(self, users.get(user_id)) or User(id=user_id)._attach(self)
 
-        if isinstance(update, (t.UpdateNewMessage, t.UpdateNewChannelMessage)):
-            if d.has(MESSAGE) and not isinstance(update.message, t.MessageEmpty):
-                d.feed(MESSAGE, Message._parse(self, update.message, users, chats))
+        if r.wants("raw"):
+            r.feed("raw", update, users, chats)
 
-        elif isinstance(update, (t.UpdateEditMessage, t.UpdateEditChannelMessage)):
-            if d.has(EDITED_MESSAGE):
-                d.feed(EDITED_MESSAGE, Message._parse(self, update.message, users, chats))
+        if isinstance(update, (o.UpdateNewMessage, o.UpdateNewChannelMessage)):
+            if r.wants("message") and not isinstance(update.message, o.MessageEmpty):
+                r.feed("message", message_from(self, update.message, users, chats))
 
-        elif isinstance(update, (t.UpdateDeleteMessages, t.UpdateDeleteChannelMessages)):
-            if d.has(DELETED_MESSAGES):
+        elif isinstance(update, (o.UpdateEditMessage, o.UpdateEditChannelMessage)):
+            if r.wants("edit"):
+                r.feed("edit", message_from(self, update.message, users, chats))
+
+        elif isinstance(update, (o.UpdateDeleteMessages, o.UpdateDeleteChannelMessages)):
+            if r.wants("delete"):
                 chat_id = (utils.CHANNEL_SHIFT - update.channel_id
-                           if isinstance(update, t.UpdateDeleteChannelMessages) else None)
-                d.feed(DELETED_MESSAGES, DeletedMessages(chat_id, list(update.messages)))
+                           if isinstance(update, o.UpdateDeleteChannelMessages) else None)
+                r.feed("delete", Deleted(chat_id, list(update.messages))._attach(self))
 
-        elif isinstance(update, t.UpdateBotCallbackQuery):
-            if d.has(CALLBACK_QUERY):
-                message = None
+        elif isinstance(update, o.UpdateBotCallbackQuery):
+            if r.wants("press"):
+                msg = None
                 try:
-                    found = await self.get_messages(utils.get_peer_id(update.peer), [update.msg_id])
-                    message = found[0] if found else None
-                except errors.RPCError as e:
-                    log.debug("Could not load the message of a callback query: %s", e)
-                d.feed(CALLBACK_QUERY, CallbackQuery(
-                    id=update.query_id,
-                    from_user=User._parse(self, users.get(update.user_id)) or User(id=update.user_id)._bind(self),
-                    chat_instance=update.chat_instance,
-                    data=_decode(update.data),
-                    message=message,
-                    game_short_name=update.game_short_name,
-                    raw=update,
-                )._bind(self))
+                    msg = await self.fetch(utils.get_peer_id(update.peer), update.msg_id)
+                except faults.TelegramFault as e:
+                    log.debug("Could not load the message under a pressed button: %s", e)
+                r.feed("press", Press(
+                    id=update.query_id, author=author(update.user_id), data=_decode(update.data),
+                    msg=msg, chat_instance=update.chat_instance, game=update.game_short_name, raw=update,
+                )._attach(self))
 
-        elif isinstance(update, t.UpdateInlineBotCallbackQuery):
-            if d.has(CALLBACK_QUERY):
-                d.feed(CALLBACK_QUERY, CallbackQuery(
-                    id=update.query_id,
-                    from_user=User._parse(self, users.get(update.user_id)) or User(id=update.user_id)._bind(self),
-                    chat_instance=update.chat_instance,
-                    data=_decode(update.data),
-                    inline_message_id=update.msg_id,
-                    game_short_name=update.game_short_name,
-                    raw=update,
-                )._bind(self))
+        elif isinstance(update, o.UpdateInlineBotCallbackQuery):
+            if r.wants("press"):
+                r.feed("press", Press(
+                    id=update.query_id, author=author(update.user_id), data=_decode(update.data),
+                    inline_id=update.msg_id, chat_instance=update.chat_instance,
+                    game=update.game_short_name, raw=update,
+                )._attach(self))
 
-        elif isinstance(update, t.UpdateBotInlineQuery):
-            if d.has(INLINE_QUERY):
-                d.feed(INLINE_QUERY, InlineQuery(
-                    id=update.query_id,
-                    from_user=User._parse(self, users.get(update.user_id)) or User(id=update.user_id)._bind(self),
-                    query=update.query,
-                    offset=update.offset,
-                    chat_type=_inline_peer_type(update.peer_type),
-                    raw=update,
-                )._bind(self))
-
-
-class DeletedMessages:
-    """Message ids that were deleted. ``chat_id`` is None outside channels,
-    because Telegram does not say which private chat or group they were in."""
-
-    def __init__(self, chat_id: Optional[int], message_ids: List[int]) -> None:
-        self.chat_id = chat_id
-        self.message_ids = message_ids
-
-    def __repr__(self) -> str:
-        return f"DeletedMessages(chat_id={self.chat_id}, message_ids={self.message_ids})"
+        elif isinstance(update, o.UpdateBotInlineQuery):
+            if r.wants("inline"):
+                r.feed("inline", Inline(
+                    id=update.query_id, author=author(update.user_id), text=update.query,
+                    offset=update.offset, chat_kind=_chat_kind(update.peer_type), raw=update,
+                )._attach(self))
 
 
 def _channel_of(update: Any) -> Optional[int]:
-    t = raw.types
+    t = schema.objects
     if isinstance(update, (t.UpdateNewChannelMessage, t.UpdateEditChannelMessage)):
         peer = getattr(update.message, "peer_id", None)
         return peer.channel_id if isinstance(peer, t.PeerChannel) else None
@@ -400,11 +421,12 @@ def _decode(data: Optional[bytes]):
         return data
 
 
-def _inline_peer_type(peer_type) -> Optional[str]:
+def _chat_kind(peer_type) -> Optional[str]:
+    """Where an inline query is being typed, in :class:`Chat` kind names."""
     if peer_type is None:
         return None
     name = type(peer_type).__name__.removeprefix("InlineQueryPeerType")
     return {
-        "SameBotPM": "sender", "PM": "private", "BotPM": "bot", "Chat": "group",
+        "SameBotPM": "self", "PM": "dm", "BotPM": "bot", "Chat": "group",
         "Megagroup": "supergroup", "Broadcast": "channel",
     }.get(name, name.lower())

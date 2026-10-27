@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 
-from wirelet import raw
+from wirelet import schema
 
 
 def _h(*parts: bytes) -> bytes:
@@ -29,14 +29,14 @@ def password_hash(password: str, salt1: bytes, salt2: bytes) -> bytes:
 
 
 def compute_check(
-    password_info: "raw.types.account.Password", password: str
-) -> "raw.types.InputCheckPasswordSRP":
+    password_info: "schema.objects.account.Password", password: str
+) -> "schema.objects.InputCheckPasswordSRP":
     from wirelet.crypto.math import check_dh_params
-    from wirelet.errors import SecurityError
+    from wirelet.faults import SecurityFault
 
     algo = password_info.current_algo
-    if not isinstance(algo, raw.types.PasswordKdfAlgoSHA256SHA256PBKDF2HMACSHA512iter100000SHA256ModPow):
-        raise SecurityError("Unsupported password algorithm; update wirelet")
+    if not isinstance(algo, schema.objects.PasswordKdfAlgoSHA256SHA256PBKDF2HMACSHA512iter100000SHA256ModPow):
+        raise SecurityFault("Unsupported password algorithm; update wirelet")
 
     p = int.from_bytes(algo.p, "big")
     g = algo.g
@@ -44,7 +44,7 @@ def compute_check(
 
     g_b = int.from_bytes(password_info.srp_B, "big")
     if not 0 < g_b < p:
-        raise SecurityError("Server SRP value is out of range")
+        raise SecurityFault("Server SRP value is out of range")
 
     x = int.from_bytes(password_hash(password, algo.salt1, algo.salt2), "big")
     v = pow(g, x, p)
@@ -73,4 +73,4 @@ def compute_check(
         k_a,
     )
 
-    return raw.types.InputCheckPasswordSRP(srp_id=password_info.srp_id, A=_pad(g_a), M1=m1)
+    return schema.objects.InputCheckPasswordSRP(srp_id=password_info.srp_id, A=_pad(g_a), M1=m1)

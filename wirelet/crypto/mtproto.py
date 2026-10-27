@@ -61,13 +61,13 @@ def pack(
 
 
 def unpack(packet: bytes, session_id: bytes, auth_key: bytes, key_id: bytes) -> Decrypted:
-    """Decrypt and verify one server packet. Raises ``SecurityError`` on any mismatch."""
-    from wirelet.errors import SecurityError
+    """Decrypt and verify one server packet. Raises ``SecurityFault`` on any mismatch."""
+    from wirelet.faults import SecurityFault
 
     if len(packet) < 24 + 32 or (len(packet) - 24) % 16:
-        raise SecurityError("Encrypted packet has an invalid length")
+        raise SecurityFault("Encrypted packet has an invalid length")
     if packet[:8] != key_id:
-        raise SecurityError("auth_key_id does not match this session")
+        raise SecurityFault("auth_key_id does not match this session")
 
     msg_key = packet[8:24]
     key, iv = kdf(auth_key, msg_key, outgoing=False)
@@ -75,18 +75,18 @@ def unpack(packet: bytes, session_id: bytes, auth_key: bytes, key_id: bytes) -> 
 
     # https://core.telegram.org/mtproto/security_guidelines#mtproto-encrypted-messages
     if hashlib.sha256(auth_key[96:128] + data).digest()[8:24] != msg_key:
-        raise SecurityError("msg_key does not match the decrypted data")
+        raise SecurityFault("msg_key does not match the decrypted data")
     if data[8:16] != session_id:
-        raise SecurityError("session_id does not match")
+        raise SecurityFault("session_id does not match")
 
     length = int.from_bytes(data[28:32], "little")
     padding = len(data) - 32 - length
     if length % 4 or not 12 <= padding <= 1024:
-        raise SecurityError("Message length or padding is invalid")
+        raise SecurityFault("Message length or padding is invalid")
 
     msg_id = int.from_bytes(data[16:24], "little")
     if msg_id % 2 != 1:
-        raise SecurityError("Server msg_id must be odd")
+        raise SecurityFault("Server msg_id must be odd")
 
     return Decrypted(
         salt=int.from_bytes(data[0:8], "little", signed=True),

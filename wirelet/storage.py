@@ -1,11 +1,10 @@
-"""Where a client keeps its auth key, update state and the peers it has seen.
+"""Where a wire keeps its auth key, update state and the peers it has seen.
 
-* :class:`FileStorage` - an SQLite file next to your script (the default).
-* :class:`MemoryStorage` - nothing touches the disk; pair it with a session
-  string to log in without a file.
+* :class:`FileStorage` - an SQLite ``<name>.wire`` file (the default).
+* :class:`MemoryStorage` - nothing on disk; pair it with a login key.
 
-A session string packs the auth key and DC into one line you can keep in an
-environment variable: ``Client("bot", session_string=os.environ["SESSION"])``.
+A login key packs the auth key and data center into one line you can keep in
+an environment variable: ``Wire(key=os.environ["WIRE_KEY"])``.
 """
 
 from __future__ import annotations
@@ -54,7 +53,7 @@ CREATE TABLE IF NOT EXISTS version (number INTEGER PRIMARY KEY);
 VERSION = 1
 
 # >B dc_id, I api_id, ? test_mode, 256s auth_key, q user_id, ? is_bot
-_STRING_FORMAT = ">BI?256sq?"
+_KEY_FORMAT = ">BI?256sq?"
 
 
 class Storage:
@@ -116,22 +115,25 @@ class Storage:
     async def set_state(self, box: int, pts: int, qts: int = 0, date: int = 0, seq: int = 0) -> None:
         self._state[box] = (pts, qts, date, seq)
 
-    # -- session strings ------------------------------------------------------ #
+    # -- login keys ----------------------------------------------------------- #
 
-    def export_session_string(self) -> str:
+    def export_key(self) -> str:
         if self.auth_key is None:
             raise ValueError("Not logged in yet")
         packed = struct.pack(
-            _STRING_FORMAT, self.dc_id, self.api_id or 0, self.test_mode,
+            _KEY_FORMAT, self.dc_id, self.api_id or 0, self.test_mode,
             self.auth_key, self.user_id or 0, bool(self.is_bot),
         )
         return base64.urlsafe_b64encode(packed).decode().rstrip("=")
 
-    def import_session_string(self, value: str) -> None:
-        data = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
-        if len(data) != struct.calcsize(_STRING_FORMAT):
-            raise ValueError("This is not a wirelet session string")
-        dc_id, api_id, test_mode, auth_key, user_id, is_bot = struct.unpack(_STRING_FORMAT, data)
+    def import_key(self, value: str) -> None:
+        try:
+            data = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        except ValueError as e:
+            raise ValueError("This is not a wirelet login key") from e
+        if len(data) != struct.calcsize(_KEY_FORMAT):
+            raise ValueError("This is not a wirelet login key")
+        dc_id, api_id, test_mode, auth_key, user_id, is_bot = struct.unpack(_KEY_FORMAT, data)
         self.dc_id, self.api_id, self.test_mode = dc_id, api_id or None, test_mode
         self.auth_key, self.user_id, self.is_bot = auth_key, user_id or None, is_bot
 

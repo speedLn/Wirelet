@@ -15,11 +15,11 @@ import time
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 
-from wirelet import errors, raw
+from wirelet import faults, schema
 from wirelet.crypto import mtproto
-from wirelet.raw.core import (
-    GZIP_PACKED_ID, MSG_CONTAINER_ID, RPC_RESULT_ID, Bytes, MsgContainer,
-    RpcResult, TLObject,
+from wirelet.schema.core import (
+    GZIP_CID, CONTAINER_CID, RPC_ANSWER_CID, Blob, Container,
+    RpcAnswer, Struct,
 )
 from .transport import Transport, TransportError
 
@@ -28,13 +28,13 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-UpdateCallback = Callable[[TLObject], Awaitable[None]]
+UpdateCallback = Callable[[Struct], Awaitable[None]]
 
 
 class _Request:
     __slots__ = ("query", "future", "msg_id", "sent_at")
 
-    def __init__(self, query: TLObject, future: asyncio.Future) -> None:
+    def __init__(self, query: Struct, future: asyncio.Future) -> None:
         self.query = query
         self.future = future
         self.msg_id = 0
@@ -56,7 +56,7 @@ class Session:
         time_offset: int,
         dcs: "DataCenters",
         transport_factory: Callable[[], Transport],
-        init_query: Callable[[TLObject], TLObject],
+        init_query: Callable[[Struct], Struct],
         media: bool = False,
         on_update: Optional[UpdateCallback] = None,
         on_new_session: Optional[Callable[[], Awaitable[None]]] = None,
@@ -134,10 +134,10 @@ class Session:
         self._connected.set()
 
     async def _send_init(self) -> None:
-        query = self._init_query(raw.functions.help.GetConfig())
+        query = self._init_query(schema.methods.help.GetConfig())
         config = await self._invoke_once(query, timeout=15)
         self._initialized = True
-        if isinstance(config, raw.types.Config):
+        if isinstance(config, schema.objects.Config):
             self.dcs.update(config)
 
         # Requests that were cut off by a reconnect go out again now.
@@ -166,7 +166,7 @@ class Session:
                     await self._connect()
                     log.info("DC%s reconnected", self.dc_id)
                     return
-                except (OSError, asyncio.TimeoutError, errors.RPCError) as e:
+                except (OSError, asyncio.TimeoutError, faults.TelegramFault) as e:
                     log.warning("Reconnect attempt %d to DC%s failed: %s", attempt + 1, self.dc_id, e)
                     if self.transport is not None:
                         await self.transport.close()
@@ -214,7 +214,7 @@ class Session:
     async def _resend(self, request: _Request) -> None:
         self._pending.pop(request.msg_id, None)
         try:
-            request.msg_id = await self._send_raw(request.query.write(), True)
+            request.msg_id = await self._send_raw(request.query.encode(), True)
         except (OSError, ConnectionError) as e:
             # Stays registered under a stale id; the next reconnect resends it.
             self._pending[request.msg_id] = request
@@ -223,12 +223,12 @@ class Session:
         request.sent_at = time.monotonic()
         self._pending[request.msg_id] = request
 
-    async def _invoke_once(self, query: TLObject, timeout: float) -> Any:
+    async def _invoke_once(self, query: Struct, timeout: float) -> Any:
         loop = asyncio.get_running_loop()
         request = _Request(query, loop.create_future())
 
         await self._flush_acks()
-        request.msg_id = await self._send_raw(query.write(), True)
+        request.msg_id = await self._send_raw(query.encode(), True)
         request.sent_at = time.monotonic()
         self._pending[request.msg_id] = request
 
@@ -240,7 +240,7 @@ class Session:
             if request.future.done():
                 self._pending.pop(request.msg_id, None)
 
-    async def invoke(self, query: TLObject, timeout: float = 30.0) -> Any:
+    async def invoke(self, query: Struct, timeout: float = 30.0) -> Any:
         """Send ``query`` and return its result, surviving reconnects in between."""
         if self._closed:
             raise ConnectionError("Session is stopped")
@@ -253,7 +253,7 @@ class Session:
 
         try:
             await self._flush_acks()
-            request.msg_id = await self._send_raw(query.write(), True)
+            request.msg_id = await self._send_raw(query.encode(), True)
         except (OSError, ConnectionError) as e:
             # Register it anyway: the reconnect resends everything pending.
             request.msg_id = -id(request)
@@ -275,7 +275,7 @@ class Session:
             return
         acks, self._acks = self._acks, []
         try:
-            await self._send_raw(raw.types.MsgsAck(msg_ids=acks).write(), False)
+            await self._send_raw(schema.objects.MsgsAck(msg_ids=acks).encode(), False)
         except (OSError, ConnectionError):
             self._acks = acks + self._acks
 
@@ -300,7 +300,7 @@ class Session:
 
             try:
                 decrypted = mtproto.unpack(packet, self.session_id, self.auth_key, self.key_id)
-            except errors.SecurityError as e:
+            except faults.SecurityFault as e:
                 log.warning("Dropping packet: %s", e)
                 continue
 
@@ -324,55 +324,55 @@ class Session:
 
         cid = int.from_bytes(body[:4], "little")
 
-        if cid == MSG_CONTAINER_ID:
-            container = MsgContainer.read(BytesIO(body[4:]))
-            for m in container.messages:
+        if cid == CONTAINER_CID:
+            container = Container.decode(BytesIO(body[4:]))
+            for m in container.envelopes:
                 await self._process(m.msg_id, m.seq_no, m.data)
             return
 
-        if cid == GZIP_PACKED_ID:
+        if cid == GZIP_CID:
             import gzip
-            await self._process(msg_id, 0, gzip.decompress(Bytes.read(BytesIO(body[4:]))))
+            await self._process(msg_id, 0, gzip.decompress(Blob.decode(BytesIO(body[4:]))))
             return
 
-        if cid == RPC_RESULT_ID:
-            self._on_rpc_result(RpcResult.read(BytesIO(body[4:])))
+        if cid == RPC_ANSWER_CID:
+            self._on_rpc_result(RpcAnswer.decode(BytesIO(body[4:])))
             return
 
-        obj = TLObject.read(BytesIO(body))
+        obj = Struct.decode(BytesIO(body))
         await self._on_service(msg_id, obj)
 
-    def _on_rpc_result(self, result: RpcResult) -> None:
+    def _on_rpc_result(self, result: RpcAnswer) -> None:
         request = self._pending.pop(result.req_msg_id, None)
         if request is None or request.future.done():
             return
 
         try:
-            value = request.query.read_result(BytesIO(result.data))
+            value = request.query.decode_result(BytesIO(result.data))
         except Exception as e:  # noqa: BLE001
             request.future.set_exception(e)
             return
 
-        if isinstance(value, raw.types.RpcError):
+        if isinstance(value, schema.objects.RpcError):
             request.future.set_exception(
-                errors.from_rpc(value.error_code, value.error_message, _query_name(request.query))
+                faults.from_telegram(value.error_code, value.error_message, _query_name(request.query))
             )
         else:
             request.future.set_result(value)
 
     async def _on_service(self, msg_id: int, obj: Any) -> None:
-        if isinstance(obj, raw.types.Pong):
+        if isinstance(obj, schema.objects.Pong):
             request = self._pending.pop(obj.msg_id, None)
             if request is not None and not request.future.done():
                 request.future.set_result(obj)
             return
 
-        if isinstance(obj, raw.types.BadServerSalt):
+        if isinstance(obj, schema.objects.BadServerSalt):
             self.salt = obj.new_server_salt
             await self._resend_bad(obj.bad_msg_id)
             return
 
-        if isinstance(obj, raw.types.BadMsgNotification):
+        if isinstance(obj, schema.objects.BadMsgNotification):
             code = obj.error_code
             if code in (16, 17):
                 # Our clock is off: take the server's time from its msg_id.
@@ -386,21 +386,21 @@ class Session:
             await self._resend_bad(obj.bad_msg_id)
             return
 
-        if isinstance(obj, raw.types.NewSessionCreated):
+        if isinstance(obj, schema.objects.NewSessionCreated):
             self.salt = obj.server_salt
             if self.on_new_session is not None:
                 asyncio.create_task(self.on_new_session())
             return
 
-        if isinstance(obj, (raw.types.MsgsAck, raw.types.MsgDetailedInfo,
-                            raw.types.MsgNewDetailedInfo, raw.types.FutureSalts,
-                            raw.types.MsgsStateInfo, raw.types.MsgsAllInfo,
-                            raw.types.DestroySessionOk, raw.types.DestroySessionNone)):
-            if isinstance(obj, raw.types.MsgDetailedInfo):
+        if isinstance(obj, (schema.objects.MsgsAck, schema.objects.MsgDetailedInfo,
+                            schema.objects.MsgNewDetailedInfo, schema.objects.FutureSalts,
+                            schema.objects.MsgsStateInfo, schema.objects.MsgsAllInfo,
+                            schema.objects.DestroySessionOk, schema.objects.DestroySessionNone)):
+            if isinstance(obj, schema.objects.MsgDetailedInfo):
                 self._acks.append(obj.answer_msg_id)
             return
 
-        if isinstance(obj, raw.base.Updates):
+        if isinstance(obj, schema.kinds.Updates):
             if self.on_update is not None:
                 await self.on_update(obj)
             return
@@ -423,7 +423,7 @@ class Session:
                 continue
             try:
                 await self.invoke(
-                    raw.functions.PingDelayDisconnect(
+                    schema.methods.PingDelayDisconnect(
                         ping_id=int.from_bytes(os.urandom(8), "little", signed=True),
                         disconnect_delay=self.PING_DISCONNECT_DELAY,
                     ),
@@ -436,8 +436,8 @@ class Session:
                 self._fail_reconnect("ping timed out")
 
 
-def _query_name(query: TLObject) -> str:
-    while hasattr(query, "query") and isinstance(getattr(query, "query"), TLObject):
+def _query_name(query: Struct) -> str:
+    while hasattr(query, "query") and isinstance(getattr(query, "query"), Struct):
         query = query.query
     return getattr(query, "TL_NAME", type(query).__name__)
 

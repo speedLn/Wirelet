@@ -17,10 +17,10 @@ import re
 from html.parser import HTMLParser
 from typing import List, Optional, Tuple
 
-from wirelet import raw
+from wirelet import schema
 from wirelet.utils import utf16_len
 
-Entities = List["raw.base.MessageEntity"]
+Entities = List["schema.kinds.MessageEntity"]
 
 
 class _HTML(HTMLParser):
@@ -52,7 +52,7 @@ class _HTML(HTMLParser):
         length = self.pos - start
         if length <= 0:
             return
-        t = raw.types
+        t = schema.objects
         simple = {
             "b": t.MessageEntityBold, "strong": t.MessageEntityBold,
             "i": t.MessageEntityItalic, "em": t.MessageEntityItalic,
@@ -187,7 +187,7 @@ def unparse_html(text: str, entities: Optional[Entities]) -> str:
     if not entities:
         return html.escape(text, quote=False)
 
-    t = raw.types
+    t = schema.objects
     utf16 = text.encode("utf-16-le")
     inserts: List[tuple] = []  # (utf16 position, close/open, tiebreaks..., tag)
 

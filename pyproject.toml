@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "speedLn" }]
-keywords = ["telegram", "mtproto", "bot", "userbot", "api", "asyncio", "client"]
+keywords = ["telegram", "mtproto", "bot", "selfbot", "api", "asyncio"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Framework :: AsyncIO",

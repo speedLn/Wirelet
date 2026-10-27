@@ -1,177 +1,222 @@
 # Wirelet
 
-**A modern MTProto framework for Telegram — bots and user accounts — in Python.**
+**Telegram over MTProto, for bots and personal accounts — in Python.**
 
-Wirelet talks to Telegram directly over MTProto, the same protocol the official
-apps use. No Bot API server in between, so you get user accounts (userbots),
-files up to 2 GB (4 GB with Premium), and every method Telegram has.
+Wirelet connects straight to Telegram with MTProto, the protocol the official
+apps speak. No Bot API server in between: personal accounts work, files go up
+to 2 GB (4 GB with Premium), and every method Telegram has is one call away.
 
-- **Latest API layer (232)**: all 1,756 types and 869 methods, generated straight from Telegram's schema
-- **Bots and users**: bot tokens, phone login, two-step verification (SRP), session strings
-- **Async** from top to bottom, with handlers, filters and HTML/Markdown formatting
-- **Reliable updates**: tracks `pts` and fetches anything lost in transit
-- **Survives the real world**: reconnects, resends, follows DC migrations, sleeps through short flood waits
-- **Typed**: every raw object has a typed constructor, and `isinstance` works against abstract types
+```python
+from wirelet import Wire
 
-> Status: early (0.1). The core protocol is tested end to end against an
-> in-process MTProto server; please report anything that misbehaves on the real network.
+wire = Wire("my_bot", app_id=12345, app_hash="0123456789abcdef", bot="123:ABC...")
+
+
+@wire.command("start")
+async def start(msg):
+    name = await msg.ask("Hi! What's your name?")
+    await msg.quote(f"Nice to meet you, <b>{name.text}</b>.")
+
+
+wire.serve()
+```
+
+- **Layer 232**: all 1,756 objects and 869 methods, generated from Telegram's own schema
+- **Bots and people**: bot tokens, phone login, two-step verification, portable login keys
+- **Conversations built in**: `await msg.ask("...")` waits for the answer
+- **Listeners with plain keywords**: `chat="dm"`, `by="me"`, `has="photo"` — no filter objects to import
+- **One `send` for everything**: text, photos, videos, voice, files, buttons, scheduling
+- **Holds up**: reconnects, resends, follows data-center moves, waits out short flood limits, recovers missed updates
+
+> Status: 0.2, early. The protocol is tested end to end against an in-process
+> MTProto server; please report anything odd you see on the real network.
 
 ## Install
 
 ```bash
 pip install "git+https://github.com/speedLn/Wirelet"
-# faster encryption for big files, and SOCKS/HTTP proxy support:
+# faster crypto for big files + SOCKS/HTTP proxies:
 pip install "wirelet[fast,proxy] @ git+https://github.com/speedLn/Wirelet"
 ```
 
-Python 3.10+. You need an `api_id` and `api_hash` from <https://my.telegram.org> — for bots too, since MTProto logs in as an app.
+Python 3.10+. Get `app_id` and `app_hash` at <https://my.telegram.org>; MTProto needs them for bots too.
 
-## A bot in 10 lines
+## Listening
+
+`wire.on` has one decorator per kind of update. Listeners take **one argument**.
+
+| Decorator | Gets |
+|---|---|
+| `@wire.on.message(...)` | a new `Message` |
+| `@wire.on.edit(...)` | an edited `Message` |
+| `@wire.on.delete(...)` | `Deleted` (`.ids`, `.chat_id`) |
+| `@wire.on.press(data)` | a `Press` on one of your buttons |
+| `@wire.on.inline(...)` | an `Inline` query (`@yourbot text`) |
+| `@wire.on.raw(...)` | `(update, users, chats)` schema objects |
+| `@wire.on.error` | `(error, update)` when a listener raises |
+| `@wire.command(name)` | a `Message` with `.cmd`, `.args`, `.rest` |
+
+Say *which* updates with keywords — all given ones must hold:
 
 ```python
-from wirelet import Client, filters
-
-app = Client("my_bot", api_id=12345, api_hash="0123456789abcdef", bot_token="123:ABC...")
-
-
-@app.on_message(filters.command("start") & filters.private)
-async def start(client, message):
-    await message.reply(f"Hello, <b>{message.from_user.first_name}</b>!")
-
-
-app.run()
+@wire.on.message(chat="dm", has="photo")          # photos in private chats
+@wire.on.message(by="me", pattern=r"^\.(\w+)")    # your own messages starting with .word
+@wire.on.message(chat=["@mychannel", -1001234567890])
+@wire.command("ban", chat="group", by=[ADMIN_ID])
+@wire.on.message(when=lambda m: len(m.text) > 500)   # anything else: a function (sync or async)
 ```
 
-The first run creates `my_bot.session`. Later runs reuse it, so `api_id`, `api_hash` and `bot_token` are optional from then on. Keep `.session` files private: they are logins.
+`chat`: `"dm" "bot" "group" "supergroup" "channel"`, ids, `@handles` ·
+`by`: `"me" "bot" "human"`, ids, `@handles` · `text`: exact text ·
+`pattern`: regex (sets `.match`) · `has`: `"media" "text" "reply" "forward" "buttons"` or a media kind ·
+`mine`: sent by you or not · `when`: your own check.
 
-## A userbot
+**Order:** the highest `priority=` goes first, and the first match handles the update.
+Return `NEXT` to hand it on to the next match. `watch=True` listeners see every
+match without taking it away (logging, stats):
 
 ```python
-from wirelet import Client, filters
+from wirelet import NEXT
 
-app = Client("me", api_id=12345, api_hash="0123456789abcdef")
+@wire.on.message(watch=True)
+async def log(msg):
+    print(msg.chat.name, msg.text)
+
+@wire.on.message(priority=10, by="@spammer")
+async def drop(msg):
+    await msg.erase()          # handled; lower-priority listeners never see it
+```
+
+## A personal account
+
+```python
+from wirelet import Wire
+
+wire = Wire("me", app_id=12345, app_hash="0123456789abcdef")
 
 
-@app.on_message(filters.me & filters.command("ping", prefixes="."))
-async def ping(client, message):
-    await message.edit_text("pong 🏓")
+@wire.command("ping", prefix=".", by="me")
+async def ping(msg):
+    await msg.rewrite("pong 🏓")
 
 
-app.run()  # asks for your phone number, login code and 2FA password the first time
+wire.serve()   # asks for your number, the code and your 2FA password the first time
+```
+
+## Messages
+
+```python
+await msg.say("to the same chat")
+await msg.quote("as a reply")
+await msg.rewrite("edited text")
+await msg.erase()
+await msg.relay("@friend")                    # forward
+await msg.relay("@friend", anonymous=True)    # copy without the header
+path = await msg.save()                       # download its file
+answer = await msg.ask("Sure? yes/no", timeout=60)
+original = await msg.replied()
+
+async with msg.typing():                      # "typing…" while you work
+    ...
+```
+
+Reading one: `msg.text` (text, or the caption), `msg.media.kind` (`photo video round gif audio voice sticker file`, or `poll`, `geo`…), `msg.author`, `msg.chat.kind`, `msg.html`, `msg.link`, `msg.sent_at`, `msg.from_me`.
+
+## Sending
+
+```python
+await wire.send("@friend", "Hello <i>there</i>")
+await wire.send(chat_id, "Holiday!", file="beach.jpg")              # kind guessed: photo
+await wire.send(chat_id, file="talk.ogg", kind="voice")
+await wire.send(chat_id, file="report.pdf", progress=lambda done, total: print(done, total))
+await wire.send(chat_id, "Later", at=datetime(2026, 12, 31, 23, 59))
+await wire.send(chat_id, file=msg.media)                           # re-send, no re-upload
 ```
 
 ## Buttons
 
 ```python
-from wirelet.types import InlineKeyboardMarkup, InlineKeyboardButton
+from wirelet import ui
+
+await msg.say("Vote:", buttons=ui.inline(
+    [ui.btn("👍", "up", style="success"), ui.btn("👎", "down", style="danger")],
+    [ui.url("Rules", "https://example.com/rules")],
+))
 
 
-@app.on_message(filters.command("menu"))
-async def menu(client, message):
-    await message.reply("Pick one:", reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("👍 Yes", "yes", style="success"),
-         InlineKeyboardButton("👎 No", "no", style="danger")],
-        [InlineKeyboardButton("Website", url="https://example.com")],
-    ]))
-
-
-@app.on_callback_query(filters.regex("^(yes|no)$"))
-async def answer(client, query):
-    await query.answer(f"You said {query.data}")
-    await query.edit_message_text(f"Answer: <b>{query.data}</b>")
+@wire.on.press(pattern=r"^(up|down)$")
+async def vote(press):
+    await press.ack(f"You voted {press.data}")
+    await press.rewrite(f"Thanks, {press.author.first}!")
 ```
 
-## Files
+Also `ui.app`, `ui.share`, `ui.copy`, `ui.profile`; reply keyboards with
+`ui.keyboard(["Yes", "No"], [ui.key("📍 Location", location=True)], once=True)`,
+`ui.hide_keyboard()`, `ui.force_reply()`; inline results with `ui.article(...)`.
+
+## Everything else: the schema
+
+Each Telegram method is in `schema.methods`, each object in `schema.objects`:
 
 ```python
-await app.send_photo("me", "cat.jpg", caption="A <i>cat</i>")
-await app.send_document(chat_id, "report.pdf", progress=lambda done, total: print(done, total))
-await app.send_video(chat_id, "https://example.com/clip.mp4")
+from wirelet import schema
 
-path = await message.download()                      # -> "downloads/..."
-data = await app.download_media(message, in_memory=True)  # -> BytesIO
-await app.send_photo(other_chat, message.photo.file_id)    # re-send without re-uploading
+config = await wire.call(schema.methods.help.GetConfig())
+peer = await wire.resolve("@durov")
 ```
 
-## Handlers and filters
+## Faults
 
-| Decorator | Gets |
-|---|---|
-| `on_message` / `on_edited_message` | `Message` |
-| `on_callback_query` | `CallbackQuery` |
-| `on_inline_query` | `InlineQuery` |
-| `on_deleted_messages` | `DeletedMessages` |
-| `on_raw_update` | `(update, users, chats)` raw objects |
-
-Filters combine with `&`, `|`, `~`: `filters.text`, `photo`, `video`, `document`, `private`, `group`, `channel`, `incoming`, `outgoing`, `me`, `reply`, `forwarded`, `command(...)`, `regex(...)`, `user(...)`, `chat(...)`, and your own with `filters.create(func)`.
-
-Handlers run in groups: `@app.on_message(filters.text, group=1)`. In each group, the first matching handler runs. Raise `StopPropagation` to stop there, or `ContinuePropagation` to let the next one try.
-
-## The whole API, raw
-
-Anything without a friendly method is one `invoke` away:
+Telegram's errors keep Telegram's names:
 
 ```python
-from wirelet import raw
-
-result = await app.invoke(raw.functions.messages.GetDialogFilters())
-peer = await app.resolve_peer("@durov")
-full = await app.invoke(raw.functions.users.GetFullUser(id=raw.types.InputUser(
-    user_id=peer.user_id, access_hash=peer.access_hash)))
-```
-
-Errors are classes named after Telegram's error, even ones newer than this release:
-
-```python
-from wirelet import errors
+from wirelet import faults
 
 try:
-    await app.send_message(chat_id, "hi")
-except errors.FloodWait as e:      # also an errors.Flood
-    print("wait", e.value, "seconds")
-except errors.ChatWriteForbidden:  # also an errors.Forbidden
+    await wire.send(chat, "hi")
+except faults.FLOOD_WAIT as e:
+    print("wait", e.amount, "s")
+except faults.CHAT_WRITE_FORBIDDEN:
+    ...
+except faults.Denied:          # any 403
     ...
 ```
 
-## Sessions
+## Logins
+
+The login lives in `<name>.wire` next to your script. Treat it like a password.
+For servers, export a key once and keep it in an environment variable:
 
 ```python
-string = app.export_session_string()          # one line, e.g. for an env variable
-app = Client("bot", session_string=string)    # logs straight in, no file
+print(wire.export_key())
+wire = Wire(key=os.environ["WIRE_KEY"])
 ```
 
-## More options
+## Options
 
 ```python
-Client(
+Wire(
     "name",
-    parse_mode="markdown",   # or "html" (default) or None
-    workers=8,               # concurrent handlers
-    sleep_threshold=10,      # auto-sleep flood waits up to this many seconds
-    skip_updates=False,      # also process what arrived while offline
-    no_updates=True,         # scripts that only send
-    proxy={"scheme": "socks5", "hostname": "127.0.0.1", "port": 1080},
-    test_mode=True,          # Telegram's test servers
+    format="markdown",          # how text is read: "html" (default), "markdown", None
+    concurrency=8,              # updates handled at once
+    auto_wait=10,               # wait out flood limits up to this many seconds
+    backlog=True,               # also deliver what arrived while offline
+    listen=False,               # send-only scripts
+    proxy="socks5://user:pass@127.0.0.1:1080",
+    test_servers=True,
 )
 ```
 
-Several clients at once:
+Several at once:
 
 ```python
-from wirelet import idle
-
-async def main():
-    async with Client("bot1", bot_token=...) as a, Client("bot2", bot_token=...) as b:
-        await idle()
+import wirelet
+wirelet.run(Wire("bot_one", bot=...), Wire("bot_two", bot=...))
 ```
 
-## Updating to a new Telegram layer
+## New Telegram layer?
 
-The API is generated from Telegram's schema in `compiler/schema/`. Drop in the new `api.tl` and run:
-
-```bash
-python -m compiler
-```
+Drop the new `api.tl` into `compiler/schema/` and run `python -m compiler`.
 
 ## Development
 
@@ -180,7 +225,9 @@ pip install -e ".[dev]"
 pytest
 ```
 
-The tests include a small MTProto server (`tests/mtproto_server.py`) that performs the real handshake and encryption from Telegram's side. That lets login, updates, reconnects and errors be tested without a network or an account.
+`tests/mtproto_server.py` plays Telegram's side of MTProto: the real handshake,
+encryption, salts and updates. So login, conversations, buttons, reconnects and
+faults are all tested without a network or an account.
 
 ## License
 
