@@ -93,14 +93,14 @@ def is_probable_prime(n: int, rounds: int = 40) -> bool:
 
 
 def check_dh_params(g: int, p: int) -> None:
-    """Raise ``SecurityError`` unless ``p`` is a safe 2048-bit prime ``g`` generates.
+    """Raise ``SecurityFault`` unless ``p`` is a safe 2048-bit prime ``g`` generates.
 
     https://core.telegram.org/mtproto/auth_key#dh-key-exchange-complete
     """
-    from wirelet.errors import SecurityError
+    from wirelet.faults import SecurityFault
 
     if p.bit_length() != 2048:
-        raise SecurityError("DH prime is not 2048 bits")
+        raise SecurityFault("DH prime is not 2048 bits")
 
     rules = {
         2: lambda: p % 8 == 7,
@@ -111,17 +111,17 @@ def check_dh_params(g: int, p: int) -> None:
         7: lambda: p % 7 in (3, 5, 6),
     }
     if g not in rules or not rules[g]():
-        raise SecurityError(f"g={g} does not generate the expected subgroup")
+        raise SecurityFault(f"g={g} does not generate the expected subgroup")
 
     if p != KNOWN_DH_PRIME:
         if not (is_probable_prime(p) and is_probable_prime((p - 1) // 2)):
-            raise SecurityError("DH prime is not a safe prime")
+            raise SecurityFault("DH prime is not a safe prime")
 
 
 def check_dh_value(value: int, p: int) -> None:
     """``1 < value < p - 1`` and away from both ends by 2^(2048-64)."""
-    from wirelet.errors import SecurityError
+    from wirelet.faults import SecurityFault
 
     bound = 1 << (2048 - 64)
     if not (1 < value < p - 1) or not (bound <= value <= p - bound):
-        raise SecurityError("DH value is out of the safe range")
+        raise SecurityFault("DH value is out of the safe range")

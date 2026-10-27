@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from wirelet import Client, errors, raw
+from wirelet import Wire, faults, schema
 from wirelet.crypto.math import KNOWN_DH_PRIME as P
 from wirelet.crypto.srp import password_hash
 from wirelet.network import dc as dcmod
@@ -18,7 +18,7 @@ from wirelet.network import dc as dcmod
 from .mtproto_server import MockServer, install_test_key
 
 PHONE, CODE, PASSWORD = "+15550001234", "12345", "correct horse"
-ME = raw.types.User(id=999, is_self=True, first_name="Me", access_hash=7, phone=PHONE[1:])
+ME = schema.objects.User(id=999, is_self=True, first_name="Me", access_hash=7, phone=PHONE[1:])
 
 
 def H(*parts):
@@ -43,7 +43,7 @@ class SRPServer:
         self.srp_id = 4242
 
     def info(self):
-        t = raw.types
+        t = schema.objects
         return t.account.Password(
             has_password=True,
             current_algo=t.PasswordKdfAlgoSHA256SHA256PBKDF2HMACSHA512iter100000SHA256ModPow(
@@ -70,7 +70,7 @@ class Telegram:
         self.migrated = False
 
     def __call__(self, query, conn):
-        f, t = raw.functions, raw.types
+        f, t = schema.methods, schema.objects
         if isinstance(query, f.help.GetConfig):
             return t.DataJSON(data="{}")
         if isinstance(query, f.auth.SendCode):
@@ -109,36 +109,32 @@ async def env(monkeypatch, tmp_path):
 
 async def test_login_with_code_and_password_after_migration(env):
     server, telegram, tmp_path = env
-    client = Client("me", api_id=1, api_hash="hash", phone_number=PHONE,
-                    phone_code=CODE, password=PASSWORD, workdir=tmp_path)
-    await client.start()
-    try:
-        assert client.me.id == 999 and not client.is_bot
+    async with Wire("me", app_id=1, app_hash="hash", phone=PHONE, code=CODE,
+                    password=PASSWORD, folder=tmp_path) as wire:
+        assert wire.me.id == 999 and not wire.is_bot and wire.me.is_me
         # Started on DC2, moved to DC4 when Telegram said PHONE_MIGRATE_4.
         assert server.seen_dc_ids == [2, 4]
-        assert client.storage.dc_id == 4
-        assert any(isinstance(q, raw.functions.auth.CheckPassword) for q in server.received)
-    finally:
-        await client.stop()
+        assert wire.storage.dc_id == 4
+        assert any(isinstance(q, schema.methods.auth.CheckPassword) for q in server.received)
 
 
 async def test_step_by_step_login_and_wrong_password(env):
     server, telegram, tmp_path = env
-    client = Client("me2", api_id=1, api_hash="hash", workdir=tmp_path, no_updates=True)
-    await client.connect()
+    wire = Wire("me2", app_id=1, app_hash="hash", folder=tmp_path, listen=False)
+    await wire.connect()
     try:
-        sent = await client.send_code(PHONE)
-        assert sent.type == "app" and sent.phone_code_hash == "h4sh"
+        ticket = await wire.request_code("+1 555 000 1234")
+        assert (ticket.phone, ticket.via, ticket.hash) == (PHONE, "app", "h4sh")
 
-        with pytest.raises(errors.PhoneCodeInvalid):
-            await client.sign_in(PHONE, sent.phone_code_hash, "00000")
-        with pytest.raises(errors.SessionPasswordNeeded) as exc:
-            await client.sign_in(PHONE, sent.phone_code_hash, CODE)
-        assert isinstance(exc.value, errors.Unauthorized)
+        with pytest.raises(faults.PHONE_CODE_INVALID):
+            await wire.verify_code(ticket, "00000")
+        with pytest.raises(faults.SESSION_PASSWORD_NEEDED) as caught:
+            await wire.verify_code(ticket, CODE)
+        assert isinstance(caught.value, faults.NotSignedIn)
 
-        with pytest.raises(errors.PasswordHashInvalid):
-            await client.check_password("wrong password")
-        user = await client.check_password(PASSWORD)
-        assert user.id == 999 and user.phone_number == PHONE[1:]
+        with pytest.raises(faults.PASSWORD_HASH_INVALID):
+            await wire.verify_password("wrong password")
+        user = await wire.verify_password(PASSWORD)
+        assert user.id == 999 and user.phone == PHONE[1:]
     finally:
-        await client.disconnect()
+        await wire.disconnect()

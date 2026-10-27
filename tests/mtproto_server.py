@@ -17,12 +17,12 @@ from typing import Any, Callable, Dict, List, Optional
 
 from cryptography.hazmat.primitives.asymmetric import rsa as crsa
 
-from wirelet import raw
+from wirelet import schema
 from wirelet.crypto import rsa as wrsa
 from wirelet.crypto.aes import ige256_decrypt, ige256_encrypt
 from wirelet.crypto.math import KNOWN_DH_PRIME
 from wirelet.crypto.mtproto import auth_key_id, kdf
-from wirelet.raw.core import Int, Long, MsgContainer, RpcResult, TLObject
+from wirelet.schema.core import I32, I64, Container, RpcAnswer, Struct
 
 # One RSA key for every test run; generating it takes a moment.
 _PRIVATE = crsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -34,7 +34,7 @@ P1, P2 = 1229739323, 1402015859  # pq the client has to factor
 
 
 def install_test_key(monkeypatch) -> None:
-    """Make the client trust this server's RSA key in production mode."""
+    """Make wirelet trust this server's RSA key in production mode."""
     monkeypatch.setattr(wrsa, "PRODUCTION_KEYS", [PUBLIC_KEY])
 
 
@@ -79,29 +79,29 @@ class Connection:
 
     # -- plain (handshake) ------------------------------------------------ #
 
-    async def plain_reply(self, obj: TLObject) -> None:
-        body = obj.write()
-        await self.write_packet(bytes(8) + Long(self.next_msg_id()) + Int(len(body)) + body)
+    async def plain_reply(self, obj: Struct) -> None:
+        body = obj.encode()
+        await self.write_packet(bytes(8) + I64(self.next_msg_id()) + I32(len(body)) + body)
 
     async def handshake(self, first: bytes) -> None:
-        def body_of(packet: bytes) -> TLObject:
+        def body_of(packet: bytes) -> Struct:
             b = BytesIO(packet[8:])
-            Long.read(b)
-            length = Int.read(b)
-            return TLObject.read(BytesIO(b.read(length)))
+            I64.decode(b)
+            length = I32.decode(b)
+            return Struct.decode(BytesIO(b.read(length)))
 
         req = body_of(first)
-        assert isinstance(req, raw.functions.ReqPqMulti)
+        assert isinstance(req, schema.methods.ReqPqMulti)
         nonce = req.nonce
         server_nonce = int.from_bytes(os.urandom(16), "little", signed=True)
         pq = (P1 * P2).to_bytes(8, "big")
-        await self.plain_reply(raw.types.ResPQ(
+        await self.plain_reply(schema.objects.ResPQ(
             nonce=nonce, server_nonce=server_nonce, pq=pq,
             server_public_key_fingerprints=[12345, PUBLIC_KEY.fingerprint],
         ))
 
         req = body_of(await self.read_packet())
-        assert isinstance(req, raw.functions.ReqDHParams)
+        assert isinstance(req, schema.methods.ReqDHParams)
         assert req.public_key_fingerprint == PUBLIC_KEY.fingerprint
         assert int.from_bytes(req.p, "big") * int.from_bytes(req.q, "big") == P1 * P2
 
@@ -111,8 +111,8 @@ class Connection:
         data_with_hash = ige256_decrypt(key_aes[32:], temp_key, bytes(32))
         data_with_padding = data_with_hash[:192][::-1]
         assert hashlib.sha256(temp_key + data_with_padding).digest() == data_with_hash[192:]
-        inner = TLObject.read(BytesIO(data_with_padding))
-        assert isinstance(inner, raw.types.PQInnerDataDc)
+        inner = Struct.decode(BytesIO(data_with_padding))
+        assert isinstance(inner, schema.objects.PQInnerDataDc)
         assert inner.nonce == nonce and inner.server_nonce == server_nonce
         self.server.seen_dc_ids.append(inner.dc)
         new_nonce = inner.new_nonce
@@ -123,29 +123,29 @@ class Connection:
 
         a = int.from_bytes(os.urandom(256), "big")
         g_a = pow(G, a, KNOWN_DH_PRIME)
-        answer = raw.types.ServerDHInnerData(
+        answer = schema.objects.ServerDHInnerData(
             nonce=nonce, server_nonce=server_nonce, g=G,
             dh_prime=KNOWN_DH_PRIME.to_bytes(256, "big"),
             g_a=g_a.to_bytes(256, "big"), server_time=int(time.time()),
-        ).write()
+        ).encode()
         payload = _sha1(answer) + answer
         payload += os.urandom(-len(payload) % 16)
-        await self.plain_reply(raw.types.ServerDHParamsOk(
+        await self.plain_reply(schema.objects.ServerDHParamsOk(
             nonce=nonce, server_nonce=server_nonce,
             encrypted_answer=ige256_encrypt(payload, tmp_key, tmp_iv),
         ))
 
         req = body_of(await self.read_packet())
-        assert isinstance(req, raw.functions.SetClientDHParams)
+        assert isinstance(req, schema.methods.SetClientDHParams)
         decrypted = ige256_decrypt(req.encrypted_data, tmp_key, tmp_iv)
         stream = BytesIO(decrypted[20:])
-        client_dh = TLObject.read(stream)
+        client_dh = Struct.decode(stream)
         assert _sha1(decrypted[20:20 + stream.tell()]) == decrypted[:20]
         g_b = int.from_bytes(client_dh.g_b, "big")
         auth_key = pow(g_b, a, KNOWN_DH_PRIME).to_bytes(256, "big")
 
         hash1 = _sha1(nn, b"\x01", _sha1(auth_key)[:8])[4:20]
-        await self.plain_reply(raw.types.DhGenOk(
+        await self.plain_reply(schema.objects.DhGenOk(
             nonce=nonce, server_nonce=server_nonce,
             new_nonce_hash1=int.from_bytes(hash1, "little", signed=True),
         ))
@@ -174,8 +174,8 @@ class Connection:
         seq = self._seq * 2 + 1 if content else self._seq * 2
         if content:
             self._seq += 1
-        data = (_le(self.server.salt, 8) + self.session_id + Long(self.next_msg_id(response))
-                + Int(seq) + Int(len(body)) + body)
+        data = (_le(self.server.salt, 8) + self.session_id + I64(self.next_msg_id(response))
+                + I32(seq) + I32(len(body)) + body)
         data += os.urandom(12 + (-(len(data) + 12) % 16))
         msg_key = hashlib.sha256(key[96:128] + data).digest()[8:24]
         aes_key, aes_iv = kdf(key, msg_key, outgoing=False)  # server->client uses x=8
@@ -184,52 +184,52 @@ class Connection:
     async def handle_encrypted(self, packet: bytes) -> None:
         salt, msg_id, seq, body = self.decrypt(packet)
         cid = int.from_bytes(body[:4], "little")
-        if cid == MsgContainer.ID:
-            for m in MsgContainer.read(BytesIO(body[4:])).messages:
+        if cid == Container.CID:
+            for m in Container.decode(BytesIO(body[4:])).envelopes:
                 await self.handle_message(salt, m.msg_id, m.data)
         else:
             await self.handle_message(salt, msg_id, body)
 
     async def handle_message(self, salt: int, msg_id: int, body: bytes) -> None:
-        query = TLObject.read(BytesIO(body))
+        query = Struct.decode(BytesIO(body))
         self.server.received.append(query)
 
-        if isinstance(query, raw.types.MsgsAck):
+        if isinstance(query, schema.objects.MsgsAck):
             return
 
         if salt != self.server.salt:
-            await self.send(raw.types.BadServerSalt(
+            await self.send(schema.objects.BadServerSalt(
                 bad_msg_id=msg_id, bad_msg_seqno=0, error_code=48, new_server_salt=self.server.salt,
-            ).write(), content=False)
+            ).encode(), content=False)
             return
 
-        if isinstance(query, (raw.functions.Ping, raw.functions.PingDelayDisconnect)):
-            await self.send(raw.types.Pong(msg_id=msg_id, ping_id=query.ping_id).write(), content=False)
+        if isinstance(query, (schema.methods.Ping, schema.methods.PingDelayDisconnect)):
+            await self.send(schema.objects.Pong(msg_id=msg_id, ping_id=query.ping_id).encode(), content=False)
             return
 
         inner = query
-        while isinstance(inner, (raw.functions.InvokeWithLayer, raw.functions.InitConnection)):
-            if isinstance(inner, raw.functions.InitConnection):
+        while isinstance(inner, (schema.methods.InvokeWithLayer, schema.methods.InitConnection)):
+            if isinstance(inner, schema.methods.InitConnection):
                 self.server.init_connections.append(inner)
             inner = inner.query
 
         result = await self.server.answer(inner, self)
         if result is None:
             return
-        if isinstance(result, raw.types.RpcError):
-            data = result.write()
+        if isinstance(result, schema.objects.RpcError):
+            data = result.encode()
         elif isinstance(result, list):
-            from wirelet.raw.core import Vector
-            data = Vector(result)
+            from wirelet.schema.core import Seq
+            data = Seq(result)
         elif isinstance(result, bool):
-            from wirelet.raw.core import Bool
-            data = Bool(result)
+            from wirelet.schema.core import Boolean
+            data = Boolean(result)
         else:
-            data = result.write()
-        await self.send(Int(RpcResult.ID, False) + Long(msg_id) + data)
+            data = result.encode()
+        await self.send(I32(RpcAnswer.CID, False) + I64(msg_id) + data)
 
-    async def push(self, obj: TLObject) -> None:
-        await self.send(obj.write(), response=False)
+    async def push(self, obj: Struct) -> None:
+        await self.send(obj.encode(), response=False)
 
     async def run(self) -> None:
         try:
@@ -250,13 +250,13 @@ class Connection:
 
 
 class MockServer:
-    def __init__(self, answer: Callable[[TLObject, Connection], Any]) -> None:
+    def __init__(self, answer: Callable[[Struct, Connection], Any]) -> None:
         self._answer = answer
         self.keys: Dict[bytes, bytes] = {}
         self.salt = int.from_bytes(os.urandom(8), "little", signed=True)
         self.connections: List[Connection] = []
-        self.received: List[TLObject] = []
-        self.init_connections: List[TLObject] = []
+        self.received: List[Struct] = []
+        self.init_connections: List[Struct] = []
         self.seen_dc_ids: List[int] = []
         self.port = 0
         self._server = None

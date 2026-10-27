@@ -10,7 +10,7 @@ import hashlib
 import os
 from typing import Dict, Iterable, NamedTuple, Optional
 
-from wirelet.raw.core import Bytes
+from wirelet.schema.core import Blob
 from .aes import ige256_encrypt
 
 
@@ -22,7 +22,7 @@ class PublicKey(NamedTuple):
     def fingerprint(self) -> int:
         n = self.n.to_bytes((self.n.bit_length() + 7) // 8, "big")
         e = self.e.to_bytes((self.e.bit_length() + 7) // 8, "big")
-        digest = hashlib.sha1(Bytes(n) + Bytes(e)).digest()
+        digest = hashlib.sha1(Blob(n) + Blob(e)).digest()
         return int.from_bytes(digest[-8:], "little", signed=True)
 
 

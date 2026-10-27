@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
-from wirelet import raw
+from wirelet import schema
 
 # (dc_id) -> [(ip, port)], from the official desktop client.
 PRODUCTION = {
@@ -62,7 +62,7 @@ class DataCenters:
         value = dc_id + (TEST_DC_SHIFT if self.test_mode else 0)
         return -value if media else value
 
-    def update(self, config: "raw.types.Config") -> None:
+    def update(self, config: "schema.objects.Config") -> None:
         main: Dict[int, List[Tuple[str, int]]] = {}
         media: Dict[int, List[Tuple[str, int]]] = {}
         cdn: Dict[int, List[Tuple[str, int]]] = {}

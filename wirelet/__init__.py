@@ -1,23 +1,24 @@
-"""wirelet - a modern MTProto framework for Telegram bots and user accounts.
+"""wirelet - Telegram over MTProto, for bots and personal accounts.
 
-    from wirelet import Client, filters
+    from wirelet import Wire
 
-    app = Client("my_bot", api_id=..., api_hash="...", bot_token="...")
+    wire = Wire("my_bot", app_id=123, app_hash="...", bot="123:ABC")
 
-    @app.on_message(filters.command("start"))
-    async def start(client, message):
-        await message.reply("Hello from wirelet!")
+    @wire.command("start")
+    async def start(msg):
+        await msg.quote("Hello from wirelet!")
 
-    app.run()
+    wire.serve()
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
-from . import enums, errors, filters, raw, types  # noqa: E402
-from .client import Client, idle  # noqa: E402
-from .dispatcher import ContinuePropagation, StopPropagation  # noqa: E402
+from . import faults, schema, ui  # noqa: E402
+from .model import Chat, Deleted, Inline, Media, Message, Press, User  # noqa: E402
+from .router import NEXT  # noqa: E402
+from .wire import Wire, forever, run  # noqa: E402
 
 __all__ = [
-    "Client", "ContinuePropagation", "StopPropagation", "enums", "errors", "filters",
-    "idle", "raw", "types", "__version__",
+    "Chat", "Deleted", "Inline", "Media", "Message", "NEXT", "Press", "User", "Wire",
+    "__version__", "faults", "forever", "run", "schema", "ui",
 ]
