@@ -141,9 +141,10 @@ class Grid:
 
     async def encode(self, wire: "Wire"):
         o = schema.objects
-        return o.ReplyInlineMarkup(rows=[
-            o.KeyboardInlineButtonRow(buttons=[await b.encode(wire) for b in row]) for row in self.rows
-        ])
+        rows = []
+        for row in self.rows:
+            rows.append(o.KeyboardInlineButtonRow(buttons=[await b.encode(wire) for b in row]))
+        return o.ReplyInlineMarkup(rows=rows)
 
 
 def inline(*rows: Row) -> Grid:
