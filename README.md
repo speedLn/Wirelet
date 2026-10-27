@@ -24,7 +24,7 @@ pip install "git+https://github.com/speedLn/Wirelet"
 pip install "wirelet[fast,proxy] @ git+https://github.com/speedLn/Wirelet"
 ```
 
-Python 3.9+. You need an `api_id` and `api_hash` from <https://my.telegram.org> — for bots too, since MTProto logs in as an app.
+Python 3.10+. You need an `api_id` and `api_hash` from <https://my.telegram.org> — for bots too, since MTProto logs in as an app.
 
 ## A bot in 10 lines
 
