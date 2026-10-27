@@ -1,12 +1,12 @@
 # Generated from compiler/schema by `python -m compiler` (and on install)
-wirelet/raw/all.py
-wirelet/raw/base/
-wirelet/raw/types/
-wirelet/raw/functions/
+wirelet/schema/registry.py
+wirelet/schema/kinds/
+wirelet/schema/objects/
+wirelet/schema/methods/
 
 # Sessions hold login keys - never commit them
-*.session
-*.session-journal
+*.wire
+*.wire-journal
 downloads/
 
 __pycache__/
