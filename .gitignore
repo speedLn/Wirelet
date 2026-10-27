@@ -1,0 +1,24 @@
+# Generated from compiler/schema by `python -m compiler` (and on install)
+wirelet/raw/all.py
+wirelet/raw/base/
+wirelet/raw/types/
+wirelet/raw/functions/
+
+# Sessions hold login keys - never commit them
+*.session
+*.session-journal
+downloads/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+.env
